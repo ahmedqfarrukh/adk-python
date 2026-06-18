@@ -27,6 +27,7 @@ __all__ = [
     'BaseCodeExecutor',
     'BuiltInCodeExecutor',
     'CodeExecutorContext',
+    'MontyCodeExecutor',
     'UnsafeLocalCodeExecutor',
     'VertexAiCodeExecutor',
     'ContainerCodeExecutor',
@@ -36,7 +37,16 @@ __all__ = [
 
 
 def __getattr__(name: str):
-  if name == 'VertexAiCodeExecutor':
+  if name == 'MontyCodeExecutor':
+    try:
+      from ._monty_code_executor import MontyCodeExecutor
+
+      return MontyCodeExecutor
+    except ImportError as e:
+      from ..utils._dependency import missing_extra
+
+      raise missing_extra('pydantic-monty', 'monty') from e
+  elif name == 'VertexAiCodeExecutor':
     try:
       from .vertex_ai_code_executor import VertexAiCodeExecutor
 

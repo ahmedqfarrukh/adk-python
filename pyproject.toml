@@ -183,6 +183,9 @@ optional-dependencies.mcp = [
   "anyio>=4.9,<5",
   "mcp>=1.24,<2",
 ]
+optional-dependencies.monty = [
+  "pydantic-monty>=0.0.18", # For MontyCodeExecutor (experimental).
+]
 optional-dependencies.otel-gcp = [
   "opentelemetry-instrumentation-google-genai>=0.7b1,<1",
   "opentelemetry-instrumentation-grpc>=0.43b0,<1",
@@ -233,6 +236,7 @@ optional-dependencies.test = [
   "pandas>=2.2.3",
   "protobuf>=6",
   "pyarrow>=14",
+  "pydantic-monty>=0.0.18",                                          # For MontyCodeExecutor tests (experimental).
   "pypika>=0.50",
   "pytest>=9,<10",
   "pytest-asyncio>=0.25",
