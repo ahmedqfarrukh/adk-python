@@ -146,8 +146,8 @@ class TestMontyCodeExecutor:
     assert result.stderr != ""
     assert "boom" in result.stderr
 
-  def test_code_preamble_documents_functions_and_limits(self):
-    """The preamble includes each function's signature, docstring, and limits."""
+  def test_code_instructions_documents_functions_and_limits(self):
+    """Instructions include each function's signature, docstring, and limits."""
 
     def lookup(item_id: int) -> str:
       """Looks up an item by id."""
@@ -155,21 +155,82 @@ class TestMontyCodeExecutor:
 
     executor = MontyCodeExecutor(external_functions={"lookup": lookup})
 
-    preamble = executor.code_preamble()
+    instructions = executor.code_instructions()
 
-    assert "def lookup(item_id: int) -> str:" in preamble
-    assert "Looks up an item by id." in preamble
-    assert "No class definitions" in preamble
-    assert "No `match` statements" in preamble
-    assert "No third-party libraries" in preamble
+    assert "def lookup(item_id: int) -> str:" in instructions
+    assert "Looks up an item by id." in instructions
+    assert "No class definitions" in instructions
+    assert "No `match` statements" in instructions
+    assert "No third-party libraries" in instructions
 
-  def test_code_preamble_states_no_os_access_when_unset(self):
-    """Without an os_handler, the preamble states there is no host access."""
+  def test_code_instructions_states_no_os_access_when_unset(self):
+    """Without an os_handler, instructions state there is no host access."""
     executor = MontyCodeExecutor()
 
-    preamble = executor.code_preamble()
+    instructions = executor.code_instructions()
 
-    assert "no filesystem, environment, network, or clock access" in preamble
+    assert (
+        "no filesystem, environment, network, or clock access" in instructions
+    )
+
+  def test_code_instructions_lists_os_operations_when_handler_present(self):
+    """With an os_handler, instructions enumerate the available OS operations."""
+    from pydantic_monty.os_access import OSAccess
+
+    executor = MontyCodeExecutor(os_handler=OSAccess(environ={"FOO": "bar"}))
+
+    instructions = executor.code_instructions()
+
+    # Concrete OS operations are advertised by their call syntax...
+    assert "os.getenv(" in instructions
+    assert "Path('p').read_text()" in instructions
+    assert "datetime.now(" in instructions
+    # ...and the generic no-access fallback is no longer used.
+    assert "no filesystem, environment, network, or clock access" not in (
+        instructions
+    )
+
+  def test_handled_os_functions_empty_without_handler(self):
+    """No os_handler means no handled OS operations are reported."""
+    executor = MontyCodeExecutor()
+
+    assert executor._handled_os_functions() == []
+
+  def test_os_handler_getenv_is_callable_in_sandbox(
+      self, mock_invocation_context: InvocationContext
+  ):
+    """Sandboxed code can read env vars routed through the os_handler."""
+    from pydantic_monty.os_access import OSAccess
+
+    executor = MontyCodeExecutor(os_handler=OSAccess(environ={"FOO": "bar"}))
+    code_input = CodeExecutionInput(code='import os\nprint(os.getenv("FOO"))')
+
+    result = executor.execute_code(mock_invocation_context, code_input)
+
+    assert result.stdout == "bar\n"
+    assert result.stderr == ""
+
+  def test_code_instructions_is_printable(self, capsys):
+    """The full instructions render (functions + OS ops) for human review."""
+    from pydantic_monty.os_access import OSAccess
+
+    def search(query: str) -> str:
+      """Searches for the query."""
+      return query
+
+    executor = MontyCodeExecutor(
+        external_functions={"search": search},
+        os_handler=OSAccess(environ={"FOO": "bar"}),
+    )
+
+    instructions = executor.code_instructions()
+    print(instructions)
+
+    captured = capsys.readouterr()
+    assert "## Host (OS) access" in captured.out
+    assert "## Available functions" in captured.out
+    assert "def search(query: str) -> str:" in captured.out
+    assert "os.getenv(" in captured.out
 
   def test_evicted_session_loses_its_persisted_state(
       self, mock_invocation_context: InvocationContext
