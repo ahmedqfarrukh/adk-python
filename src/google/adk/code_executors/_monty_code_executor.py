@@ -20,8 +20,8 @@ import inspect
 import logging
 import threading
 from typing import Any
+from typing import Awaitable
 from typing import Callable
-from typing import Coroutine
 from typing import get_args
 from typing import Protocol
 
@@ -121,25 +121,32 @@ class _ReplCacheFn(Protocol):
     ...
 
 
-def _run_async_blocking(coro: Coroutine[Any, Any, Any]) -> Any:
-  """Runs `coro` to completion on a separate thread with a fresh event loop.
+def _run_async_blocking(awaitable: Awaitable[Any]) -> Any:
+  """Runs `awaitable` to completion on a separate thread with a fresh loop.
 
   Used only when an external function is a coroutine function, so the
   synchronous `execute_code` can drive Monty's async `feed_run_async`. Running
   on a dedicated thread avoids `asyncio.run` failing when the calling thread
   already has a running event loop (the ADK flow's loop).
 
+  `feed_run_async` returns a custom awaitable (not a native coroutine), so it is
+  wrapped in a coroutine before being handed to `asyncio.run` -- on Python 3.11
+  `asyncio.run` rejects non-coroutine awaitables outright.
+
   Args:
-    coro: The coroutine to run to completion.
+    awaitable: The awaitable to run to completion.
 
   Returns:
-    The value returned by the coroutine.
+    The value produced by the awaitable.
   """
   result: dict[str, Any] = {}
 
+  async def _drive() -> Any:
+    return await awaitable
+
   def _runner() -> None:
     try:
-      result['value'] = asyncio.run(coro)
+      result['value'] = asyncio.run(_drive())
     except BaseException as exc:  # surface inside the calling thread
       result['error'] = exc
 
