@@ -163,8 +163,8 @@ class TestMontyCodeExecutor:
     assert "No `match` statements" in instructions
     assert "No third-party libraries" in instructions
 
-  def test_code_instructions_states_no_os_access_when_unset(self):
-    """Without an os_handler, instructions state there is no host access."""
+  def test_code_instructions_states_no_os_access_when_callback_unset(self):
+    """Without an os_callback, instructions state there is no host access."""
     executor = MontyCodeExecutor()
 
     instructions = executor.code_instructions()
@@ -173,36 +173,51 @@ class TestMontyCodeExecutor:
         "no filesystem, environment, network, or clock access" in instructions
     )
 
-  def test_code_instructions_lists_os_operations_when_handler_present(self):
-    """With an os_handler, instructions enumerate the available OS operations."""
-    from pydantic_monty.os_access import OSAccess
+  def test_code_instructions_uses_os_description_when_callback_present(self):
+    """With an os_callback + os_description, the description is surfaced."""
 
-    executor = MontyCodeExecutor(os_handler=OSAccess(environ={"FOO": "bar"}))
+    def os_callback(function_name, args, kwargs):
+      return None
+
+    executor = MontyCodeExecutor(
+        os_callback=os_callback,
+        os_description="You may read env vars via `os.getenv('NAME')`.",
+    )
 
     instructions = executor.code_instructions()
 
-    # Concrete OS operations are advertised by their call syntax...
-    assert "os.getenv(" in instructions
-    assert "Path('p').read_text()" in instructions
-    assert "datetime.now(" in instructions
-    # ...and the generic no-access fallback is no longer used.
+    assert "You may read env vars via `os.getenv('NAME')`." in instructions
+    # The generic no-access fallback must not be used when a callback is set.
     assert "no filesystem, environment, network, or clock access" not in (
         instructions
     )
 
-  def test_handled_os_functions_empty_without_handler(self):
-    """No os_handler means no handled OS operations are reported."""
-    executor = MontyCodeExecutor()
+  def test_code_instructions_uses_generic_os_note_without_description(self):
+    """An os_callback with no description falls back to a generic OS note."""
 
-    assert executor._handled_os_functions() == []
+    def os_callback(function_name, args, kwargs):
+      return None
 
-  def test_os_handler_getenv_is_callable_in_sandbox(
+    executor = MontyCodeExecutor(os_callback=os_callback)
+
+    instructions = executor.code_instructions()
+
+    assert "A controlled host (OS) surface is available" in instructions
+    assert "no filesystem, environment, network, or clock access" not in (
+        instructions
+    )
+
+  def test_os_callback_getenv_is_dispatched_in_sandbox(
       self, mock_invocation_context: InvocationContext
   ):
-    """Sandboxed code can read env vars routed through the os_handler."""
-    from pydantic_monty.os_access import OSAccess
+    """Sandboxed code reads env vars routed through a raw os_callback."""
 
-    executor = MontyCodeExecutor(os_handler=OSAccess(environ={"FOO": "bar"}))
+    def os_callback(function_name, args, kwargs):
+      if function_name == "os.getenv" and args and args[0] == "FOO":
+        return "bar"
+      return None
+
+    executor = MontyCodeExecutor(os_callback=os_callback)
     code_input = CodeExecutionInput(code='import os\nprint(os.getenv("FOO"))')
 
     result = executor.execute_code(mock_invocation_context, code_input)
@@ -210,17 +225,65 @@ class TestMontyCodeExecutor:
     assert result.stdout == "bar\n"
     assert result.stderr == ""
 
+  def test_os_callback_returns_not_handled_falls_back(
+      self, mock_invocation_context: InvocationContext
+  ):
+    """Returning NOT_HANDLED defers to Monty's default unhandled behavior."""
+    from pydantic_monty import NOT_HANDLED
+
+    def os_callback(function_name, args, kwargs):
+      return NOT_HANDLED
+
+    executor = MontyCodeExecutor(os_callback=os_callback)
+    code_input = CodeExecutionInput(code='import os\nprint(os.getenv("FOO"))')
+
+    result = executor.execute_code(mock_invocation_context, code_input)
+
+    # Monty's default unhandled OS behavior raises, surfaced as stderr.
+    assert result.stderr != ""
+
+  def test_os_callback_works_with_async_external_function(
+      self, mock_invocation_context: InvocationContext
+  ):
+    """The async run path also dispatches OS calls through the raw callback."""
+
+    def os_callback(function_name, args, kwargs):
+      if function_name == "os.getenv" and args and args[0] == "FOO":
+        return "bar"
+      return None
+
+    async def fetch(url: str) -> str:
+      """Fetches the url."""
+      return f"fetched {url}"
+
+    executor = MontyCodeExecutor(
+        external_functions={"fetch": fetch}, os_callback=os_callback
+    )
+    code_input = CodeExecutionInput(
+        code=(
+            'import os\nprint(os.getenv("FOO"))\nprint(await fetch("http://x"))'
+        )
+    )
+
+    result = executor.execute_code(mock_invocation_context, code_input)
+
+    assert result.stdout == "bar\nfetched http://x\n"
+    assert result.stderr == ""
+
   def test_code_instructions_is_printable(self, capsys):
-    """The full instructions render (functions + OS ops) for human review."""
-    from pydantic_monty.os_access import OSAccess
+    """The full instructions render (functions + OS) for human review."""
 
     def search(query: str) -> str:
       """Searches for the query."""
       return query
 
+    def os_callback(function_name, args, kwargs):
+      return None
+
     executor = MontyCodeExecutor(
         external_functions={"search": search},
-        os_handler=OSAccess(environ={"FOO": "bar"}),
+        os_callback=os_callback,
+        os_description="Env vars are readable via `os.getenv('NAME')`.",
     )
 
     instructions = executor.code_instructions()

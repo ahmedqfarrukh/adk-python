@@ -22,7 +22,6 @@ import threading
 from typing import Any
 from typing import Awaitable
 from typing import Callable
-from typing import get_args
 from typing import Protocol
 
 from pydantic import ConfigDict
@@ -32,7 +31,6 @@ from pydantic_monty import CollectString
 from pydantic_monty import MontyError
 from pydantic_monty import MontyRepl
 from pydantic_monty import MontyRuntimeError
-from pydantic_monty.os_access import AbstractOS
 from pydantic_monty.os_access import OsFunction
 from typing_extensions import override
 
@@ -43,64 +41,10 @@ from .code_execution_utils import CodeExecutionResult
 
 logger = logging.getLogger('google_adk.' + __name__)
 
-
-# Maps each Monty `OsFunction` literal to the `AbstractOS` method that backs it.
-# This mirrors `AbstractOS.dispatch`, so the prompt instructions, the runtime
-# dispatch, and the type checker never drift. The `OsFunction` Literal is the
-# source of truth for the set of operations (see `_handled_os_functions`).
-_OS_FUNCTION_TO_METHOD: dict[OsFunction, str] = {
-    'Path.exists': 'path_exists',
-    'Path.is_file': 'path_is_file',
-    'Path.is_dir': 'path_is_dir',
-    'Path.is_symlink': 'path_is_symlink',
-    'Open': 'path_open',
-    'Path.read_text': 'path_read_text',
-    'Path.read_bytes': 'path_read_bytes',
-    'Path.write_text': 'path_write_text',
-    'Path.write_bytes': 'path_write_bytes',
-    'Path.append_text': 'path_append_text',
-    'Path.append_bytes': 'path_append_bytes',
-    'Path.mkdir': 'path_mkdir',
-    'Path.unlink': 'path_unlink',
-    'Path.rmdir': 'path_rmdir',
-    'Path.iterdir': 'path_iterdir',
-    'Path.stat': 'path_stat',
-    'Path.rename': 'path_rename',
-    'Path.resolve': 'path_resolve',
-    'Path.absolute': 'path_absolute',
-    'os.getenv': 'getenv',
-    'os.environ': 'get_environ',
-    'date.today': 'date_today',
-    'datetime.now': 'datetime_now',
-}
-
-# LLM-facing call syntax for each `OsFunction`. Rendered into the instructions so
-# the model knows exactly how to invoke an available host operation.
-_OS_FUNCTION_USAGE: dict[OsFunction, str] = {
-    'Path.exists': "Path('p').exists() -> bool",
-    'Path.is_file': "Path('p').is_file() -> bool",
-    'Path.is_dir': "Path('p').is_dir() -> bool",
-    'Path.is_symlink': "Path('p').is_symlink() -> bool",
-    'Open': "open('p', mode) -> file object",
-    'Path.read_text': "Path('p').read_text() -> str",
-    'Path.read_bytes': "Path('p').read_bytes() -> bytes",
-    'Path.write_text': "Path('p').write_text(data: str) -> int",
-    'Path.write_bytes': "Path('p').write_bytes(data: bytes) -> int",
-    'Path.append_text': "append text to Path('p')",
-    'Path.append_bytes': "append bytes to Path('p')",
-    'Path.mkdir': "Path('p').mkdir(parents=False, exist_ok=False)",
-    'Path.unlink': "Path('p').unlink()",
-    'Path.rmdir': "Path('p').rmdir()",
-    'Path.iterdir': "Path('p').iterdir() -> Iterable[Path]",
-    'Path.stat': "Path('p').stat()",
-    'Path.rename': "Path('p').rename(target)",
-    'Path.resolve': "Path('p').resolve() -> Path",
-    'Path.absolute': "Path('p').absolute() -> Path",
-    'os.getenv': "os.getenv('NAME', default=None) -> str | None",
-    'os.environ': 'os.environ -> mapping of environment variables',
-    'date.today': 'date.today() -> date',
-    'datetime.now': 'datetime.now(tz=None) -> datetime',
-}
+# Type of the callback Monty's `os=` run parameter accepts: it receives the
+# operation name plus its positional/keyword args and returns the result, or
+# `pydantic_monty.NOT_HANDLED` to fall back to Monty's default behavior.
+OsCallback = Callable[[OsFunction, tuple[Any, ...], dict[str, Any]], Any]
 
 
 class _ReplCacheFn(Protocol):
@@ -269,14 +213,14 @@ _MONTY_LANGUAGE_LIMITS = (
 class MontyCodeExecutor(BaseCodeExecutor):
   """Executes model-generated Python inside the Monty sandbox.
 
-  User-declared external functions and an optional OS handler are exposed to
+  User-declared external functions and an optional OS callback are exposed to
   the executed code, mirroring Monty's own ``external_functions`` / ``os``
   parameters. These are independent of any framework tools; redirecting an
   external function to a framework tool is left to the caller. State persists
   across code blocks via a per-execution-id MontyRepl.
 
   NOTE: A single MontyCodeExecutor instance carries one set of external
-  functions / OS handler and one REPL cache, so it must NOT be used by
+  functions / OS callback and one REPL cache, so it must NOT be used by
   multiple agents simultaneously -- give each agent its own instance. Sharing
   one instance between an agent and its sub-agents is fine.
   """
@@ -294,9 +238,20 @@ class MontyCodeExecutor(BaseCodeExecutor):
   be synchronous or coroutine functions; they are the user's own (they may wrap
   a framework tool if they choose). Excluded from serialization."""
 
-  os_handler: AbstractOS | None = Field(default=None, exclude=True)
-  """Optional controlled OS surface (filesystem/env/clock). None means no host
-  access; OS calls fall through to Monty's default unhandled behavior."""
+  os_callback: OsCallback | None = Field(default=None, exclude=True)
+  """Optional callback for Monty's ``os=`` run surface (filesystem/env/clock).
+
+  Passed straight to ``feed_run`` / ``feed_run_async``. It is invoked with
+  ``(function_name, args, kwargs)`` -- e.g. ``('os.getenv', ('FOO',), {})`` --
+  and must return the operation's result, or ``pydantic_monty.NOT_HANDLED`` to
+  fall back to Monty's default unhandled behavior. None means no host access:
+  every OS call falls through to that default. Excluded from serialization."""
+
+  os_description: str | None = Field(default=None, exclude=True)
+  """Optional Markdown describing what ``os_callback`` supports, surfaced to the
+  model via ``code_instructions``. The callback is opaque (a plain function), so
+  there is nothing to introspect -- supply this to keep the prompt and the
+  callback's real behavior aligned. Ignored when ``os_callback`` is None."""
 
   script_name: str = 'agent.py'
   """The script name shown in Monty tracebacks."""
@@ -351,12 +306,18 @@ class MontyCodeExecutor(BaseCodeExecutor):
       if has_async:
         # feed_run_async must be awaited; bridge from this sync method on a
         # dedicated worker thread (we may be inside the flow's running loop).
+        #
+        # The `feed_run_async` stub types `os` as `AbstractOS`, but Monty only
+        # ever calls it as `os(function_name, args, kwargs)` -- exactly the
+        # `os_callback` contract. A plain callable is verified to work here at
+        # runtime (the sync `feed_run` path is typed for a raw callable), so we
+        # pass it directly and silence the stub-only mismatch.
         output = _run_async_blocking(
             repl.feed_run_async(
                 code_execution_input.code,
                 external_functions=self.external_functions,
                 print_callback=collector,
-                os=self.os_handler,
+                os=self.os_callback,  # type: ignore[arg-type]
             )
         )
       else:
@@ -365,7 +326,7 @@ class MontyCodeExecutor(BaseCodeExecutor):
             code_execution_input.code,
             external_functions=self.external_functions,
             print_callback=collector,
-            os=self.os_handler,
+            os=self.os_callback,
         )
     except MontyError as exc:
       return CodeExecutionResult(
@@ -387,25 +348,30 @@ class MontyCodeExecutor(BaseCodeExecutor):
 
     The caller injects this into the agent's instruction -- specifically the
     *static* instructions, since the sandbox API surface (external functions and
-    OS operations) is fixed for the lifetime of the executor instance and does
-    not vary per turn. It is derived from the same ``external_functions`` and
-    ``os_handler`` that drive execution, so the prompt, the type-check stubs, and
-    the runtime dispatch never drift.
+    OS access) is fixed for the lifetime of the executor instance and does not
+    vary per turn. It is derived from the same ``external_functions`` and
+    ``os_callback`` / ``os_description`` that drive execution, so the prompt and
+    the type-check stubs stay aligned.
 
     Returns:
-      A Markdown snippet documenting the sandbox limits, the available OS
-      operations, the external functions (with typed signatures and
-      docstrings), and the I/O contract.
+      A Markdown snippet documenting the sandbox limits, the host (OS) access,
+      the external functions (with typed signatures and docstrings), and the
+      I/O contract.
     """
     sections = [_MONTY_LANGUAGE_LIMITS]
 
     sections.append('## Host (OS) access')
-    handled = self._handled_os_functions()
-    if handled:
-      os_lines = ['A controlled OS surface is available. You may call:']
-      os_lines.extend(f'- `{_OS_FUNCTION_USAGE.get(fn, fn)}`' for fn in handled)
-      os_lines.append('Network access is not available.')
-      sections.append('\n'.join(os_lines))
+    if self.os_callback is not None:
+      # The callback is opaque, so we cannot enumerate operations; rely on the
+      # caller-supplied description (or a generic note when none is given).
+      sections.append(
+          self.os_description
+          or (
+              'A controlled host (OS) surface is available through the usual'
+              ' `pathlib.Path`, `os`, and `datetime` calls. Network access is'
+              ' not available.'
+          )
+      )
     else:
       sections.append(
           'There is no filesystem, environment, network, or clock access.'
@@ -428,41 +394,6 @@ class MontyCodeExecutor(BaseCodeExecutor):
         ' your code are returned to you as the observation.'
     )
     return '\n\n'.join(sections)
-
-  def _handled_os_functions(self) -> list[OsFunction]:
-    """Returns the OS operations the configured ``os_handler`` implements.
-
-    Iterates the ``OsFunction`` literal (the source of truth) and keeps each
-    operation whose backing ``AbstractOS`` method is concretely implemented on
-    the handler -- i.e. not left as an ``@abstractmethod`` stub. This is what
-    keeps the instructions, the runtime dispatch, and Monty's own operation set
-    aligned.
-
-    NOTE: An operation a subclass disables at runtime by returning
-    ``NOT_HANDLED`` (rather than leaving it abstract) cannot be detected
-    statically, so it is still listed. Leave such operations unimplemented if
-    you want them omitted from the instructions.
-
-    Returns:
-      The handled operations in the canonical ``OsFunction`` order, or an empty
-      list when no ``os_handler`` is configured.
-    """
-    if self.os_handler is None:
-      return []
-    handler_type = type(self.os_handler)
-    handled: list[OsFunction] = []
-    for function_name in get_args(OsFunction):
-      method_name = _OS_FUNCTION_TO_METHOD.get(function_name)
-      if method_name is None:
-        # Monty added an OsFunction we have not mapped yet; skip rather than
-        # guess at how to call it.
-        logger.warning('Unmapped Monty OsFunction: %s', function_name)
-        continue
-      method = getattr(handler_type, method_name, None)
-      if method is None or getattr(method, '__isabstractmethod__', False):
-        continue
-      handled.append(function_name)
-    return handled
 
   def _build_type_stubs(self) -> str:
     """Builds Monty `type_check_stubs` declarations for external functions.
