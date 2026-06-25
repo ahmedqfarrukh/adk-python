@@ -124,6 +124,28 @@ Total columns: {df.shape[1]}
 '''
 
 
+def _get_code_contents(
+    code_executor: BaseCodeExecutor,
+) -> list[types.Content]:
+  """Returns deep-copied self-description Content(s) for the executor.
+
+  Returns an empty list for executors that do not describe themselves (the base
+  ``code_content()`` returns ``None``), so callers can treat "no description"
+  and "has a description" uniformly. Deep-copied so the executor's own object
+  (which it may cache) is never mutated by downstream request handling.
+
+  Args:
+    code_executor: The executor to ask for a self-description.
+
+  Returns:
+    A single-element list with the deep-copied description, or an empty list.
+  """
+  instruction_content = code_executor.code_content()
+  if instruction_content is None:
+    return []
+  return [copy.deepcopy(instruction_content)]
+
+
 class _CodeExecutionRequestProcessor(BaseLlmRequestProcessor):
   """Processes code execution requests."""
 
@@ -145,6 +167,16 @@ class _CodeExecutionRequestProcessor(BaseLlmRequestProcessor):
     # Convert the code execution parts to text parts.
     if not isinstance(invocation_context.agent.code_executor, BaseCodeExecutor):
       return
+
+    # Let the executor describe itself to the model. The text is folded into the
+    # request's system instruction via append_instructions, sidestepping the
+    # user/model role-alternation that a standalone content would risk. This is
+    # a no-op for executors that do not override code_content().
+    for instruction_content in _get_code_contents(
+        invocation_context.agent.code_executor
+    ):
+      llm_request.append_instructions(instruction_content)
+
     for content in llm_request.contents:
       CodeExecutionUtils.convert_code_execution_parts(
           content,

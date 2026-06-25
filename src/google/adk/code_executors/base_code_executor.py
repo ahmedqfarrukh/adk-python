@@ -18,6 +18,7 @@ import abc
 from typing import List
 from typing import Optional
 
+from google.genai import types
 from pydantic import BaseModel
 
 from ..agents.invocation_context import InvocationContext
@@ -95,3 +96,17 @@ class BaseCodeExecutor(BaseModel):
       The code execution result.
     """
     pass
+
+  def code_content(self) -> Optional[types.Content]:
+    """Returns a Content describing this executor to the model, or None.
+
+    Executors that expose a custom API surface (sandbox limits, available
+    functions, OS access, I/O contract) override this so the flow can fold the
+    description into the model request's system instruction. Returning None (the
+    default) means the executor contributes no self-description, leaving the
+    request untouched.
+
+    Returns:
+      A Content describing the executor, or None when there is nothing to add.
+    """
+    return None

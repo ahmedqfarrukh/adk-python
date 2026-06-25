@@ -24,6 +24,7 @@ from typing import Awaitable
 from typing import Callable
 from typing import Protocol
 
+from google.genai import types
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import PrivateAttr
@@ -249,7 +250,7 @@ class MontyCodeExecutor(BaseCodeExecutor):
 
   os_description: str | None = Field(default=None, exclude=True)
   """Optional Markdown describing what ``os_callback`` supports, surfaced to the
-  model via ``code_instructions``. The callback is opaque (a plain function), so
+  model via ``code_content``. The callback is opaque (a plain function), so
   there is nothing to introspect -- supply this to keep the prompt and the
   callback's real behavior aligned. Ignored when ``os_callback`` is None."""
 
@@ -343,15 +344,30 @@ class MontyCodeExecutor(BaseCodeExecutor):
       stdout += str(output)
     return CodeExecutionResult(stdout=stdout, stderr='', output_files=[])
 
-  def code_instructions(self) -> str:
+  @override
+  def code_content(self) -> types.Content:
+    """Describes the sandbox to the model as a single text ``Content``.
+
+    The flow folds this into the request's system instruction. It wraps
+    ``_build_instructions_text`` -- the sandbox API surface (external functions
+    and OS access) is fixed for the lifetime of the executor instance and does
+    not vary per turn, so a single static description is correct.
+
+    Returns:
+      A ``user``-role ``Content`` whose only ``Part`` is the Markdown sandbox
+      description.
+    """
+    return types.Content(
+        role='user',
+        parts=[types.Part(text=self._build_instructions_text())],
+    )
+
+  def _build_instructions_text(self) -> str:
     """Returns a prompt-ready Markdown snippet describing the sandbox.
 
-    The caller injects this into the agent's instruction -- specifically the
-    *static* instructions, since the sandbox API surface (external functions and
-    OS access) is fixed for the lifetime of the executor instance and does not
-    vary per turn. It is derived from the same ``external_functions`` and
-    ``os_callback`` / ``os_description`` that drive execution, so the prompt and
-    the type-check stubs stay aligned.
+    Derived from the same ``external_functions`` and ``os_callback`` /
+    ``os_description`` that drive execution, so the prompt and the type-check
+    stubs stay aligned.
 
     Returns:
       A Markdown snippet documenting the sandbox limits, the host (OS) access,

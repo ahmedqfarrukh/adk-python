@@ -20,14 +20,19 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
+from google.adk.agents.invocation_context import InvocationContext
 from google.adk.agents.llm_agent import Agent
 from google.adk.code_executors.base_code_executor import BaseCodeExecutor
 from google.adk.code_executors.built_in_code_executor import BuiltInCodeExecutor
+from google.adk.code_executors.code_execution_utils import CodeExecutionInput
 from google.adk.code_executors.code_execution_utils import CodeExecutionResult
 from google.adk.code_executors.code_execution_utils import File
 from google.adk.flows.llm_flows._code_execution import _DATA_FILE_HELPER_LIB
+from google.adk.flows.llm_flows._code_execution import _get_code_contents
 from google.adk.flows.llm_flows._code_execution import _get_data_file_preprocessing_code
+from google.adk.flows.llm_flows._code_execution import request_processor
 from google.adk.flows.llm_flows._code_execution import response_processor
+from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
 import pytest
@@ -207,3 +212,98 @@ def test_get_data_file_preprocessing_code_injection_reproduction():
       break
 
   assert read_csv_arg == bad_filename
+
+
+# A shared description object lets the deep-copy test verify the flow never
+# mutates the executor's own (possibly cached) Content.
+_SHARED_DESCRIPTION = types.Content(
+    role='user', parts=[types.Part(text='SANDBOX DOCS')]
+)
+
+
+class _DescribingCodeExecutor(BaseCodeExecutor):
+  """A fake executor that describes itself via code_content()."""
+
+  def execute_code(
+      self,
+      invocation_context: InvocationContext,
+      code_execution_input: CodeExecutionInput,
+  ) -> CodeExecutionResult:
+    return CodeExecutionResult(stdout='', stderr='', output_files=[])
+
+  def code_content(self) -> types.Content:
+    return _SHARED_DESCRIPTION
+
+
+class _SilentCodeExecutor(BaseCodeExecutor):
+  """A fake executor that does not describe itself (inherits the None default)."""
+
+  def execute_code(
+      self,
+      invocation_context: InvocationContext,
+      code_execution_input: CodeExecutionInput,
+  ) -> CodeExecutionResult:
+    return CodeExecutionResult(stdout='', stderr='', output_files=[])
+
+
+@pytest.mark.asyncio
+async def test_self_description_folded_into_system_instruction():
+  """An executor's code_content() text lands in the request system instruction."""
+  agent = Agent(name='test_agent', code_executor=_DescribingCodeExecutor())
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent, user_content='test message'
+  )
+  llm_request = LlmRequest()
+
+  _ = [
+      event
+      async for event in request_processor.run_async(
+          invocation_context, llm_request
+      )
+  ]
+
+  assert 'SANDBOX DOCS' in (llm_request.config.system_instruction or '')
+  # A text-only description is folded into the system instruction, not appended
+  # as a standalone content (which would risk user/model role alternation).
+  assert all(
+      not any(part.text == 'SANDBOX DOCS' for part in content.parts)
+      for content in llm_request.contents
+  )
+
+
+@pytest.mark.asyncio
+async def test_executor_without_code_content_adds_nothing():
+  """An executor returning None contributes no instruction and no content."""
+  agent = Agent(name='test_agent', code_executor=_SilentCodeExecutor())
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=agent, user_content='test message'
+  )
+  llm_request = LlmRequest()
+
+  _ = [
+      event
+      async for event in request_processor.run_async(
+          invocation_context, llm_request
+      )
+  ]
+
+  assert not llm_request.config.system_instruction
+  assert llm_request.contents == []
+
+
+def test_get_code_contents_deep_copies_executor_content():
+  """_get_code_contents returns a deep copy, never the executor's own object."""
+  executor = _DescribingCodeExecutor()
+
+  [returned] = _get_code_contents(executor)
+
+  assert returned is not _SHARED_DESCRIPTION
+  assert returned.parts[0] is not _SHARED_DESCRIPTION.parts[0]
+  # Mutating the returned copy must not corrupt the executor's shared object.
+  returned.parts[0].text = 'MUTATED'
+  assert _SHARED_DESCRIPTION.parts[0].text == 'SANDBOX DOCS'
+
+
+def test_get_code_contents_empty_when_no_description():
+  """_get_code_contents yields an empty list for a non-describing executor."""
+  assert _get_code_contents(_SilentCodeExecutor()) == []

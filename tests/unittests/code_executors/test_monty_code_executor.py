@@ -25,6 +25,7 @@ from google.adk.code_executors.code_execution_utils import CodeExecutionInput
 from google.adk.code_executors.code_execution_utils import CodeExecutionResult
 from google.adk.sessions.base_session_service import BaseSessionService
 from google.adk.sessions.session import Session
+from google.genai import types
 
 
 @pytest.fixture
@@ -146,8 +147,19 @@ class TestMontyCodeExecutor:
     assert result.stderr != ""
     assert "boom" in result.stderr
 
-  def test_code_instructions_documents_functions_and_limits(self):
-    """Instructions include each function's signature, docstring, and limits."""
+  def test_code_content_returns_content_with_single_text_part(self):
+    """code_content returns a user-role Content with exactly one text Part."""
+    executor = MontyCodeExecutor()
+
+    content = executor.code_content()
+
+    assert isinstance(content, types.Content)
+    assert content.role == "user"
+    assert len(content.parts) == 1
+    assert content.parts[0].text
+
+  def test_code_content_documents_functions_and_limits(self):
+    """Description includes each function's signature, docstring, and limits."""
 
     def lookup(item_id: int) -> str:
       """Looks up an item by id."""
@@ -155,7 +167,7 @@ class TestMontyCodeExecutor:
 
     executor = MontyCodeExecutor(external_functions={"lookup": lookup})
 
-    instructions = executor.code_instructions()
+    instructions = executor.code_content().parts[0].text
 
     assert "def lookup(item_id: int) -> str:" in instructions
     assert "Looks up an item by id." in instructions
@@ -163,17 +175,17 @@ class TestMontyCodeExecutor:
     assert "No `match` statements" in instructions
     assert "No third-party libraries" in instructions
 
-  def test_code_instructions_states_no_os_access_when_callback_unset(self):
-    """Without an os_callback, instructions state there is no host access."""
+  def test_code_content_states_no_os_access_when_callback_unset(self):
+    """Without an os_callback, the description states there is no host access."""
     executor = MontyCodeExecutor()
 
-    instructions = executor.code_instructions()
+    instructions = executor.code_content().parts[0].text
 
     assert (
         "no filesystem, environment, network, or clock access" in instructions
     )
 
-  def test_code_instructions_uses_os_description_when_callback_present(self):
+  def test_code_content_uses_os_description_when_callback_present(self):
     """With an os_callback + os_description, the description is surfaced."""
 
     def os_callback(function_name, args, kwargs):
@@ -184,7 +196,7 @@ class TestMontyCodeExecutor:
         os_description="You may read env vars via `os.getenv('NAME')`.",
     )
 
-    instructions = executor.code_instructions()
+    instructions = executor.code_content().parts[0].text
 
     assert "You may read env vars via `os.getenv('NAME')`." in instructions
     # The generic no-access fallback must not be used when a callback is set.
@@ -192,7 +204,7 @@ class TestMontyCodeExecutor:
         instructions
     )
 
-  def test_code_instructions_uses_generic_os_note_without_description(self):
+  def test_code_content_uses_generic_os_note_without_description(self):
     """An os_callback with no description falls back to a generic OS note."""
 
     def os_callback(function_name, args, kwargs):
@@ -200,7 +212,7 @@ class TestMontyCodeExecutor:
 
     executor = MontyCodeExecutor(os_callback=os_callback)
 
-    instructions = executor.code_instructions()
+    instructions = executor.code_content().parts[0].text
 
     assert "A controlled host (OS) surface is available" in instructions
     assert "no filesystem, environment, network, or clock access" not in (
@@ -270,8 +282,8 @@ class TestMontyCodeExecutor:
     assert result.stdout == "bar\nfetched http://x\n"
     assert result.stderr == ""
 
-  def test_code_instructions_is_printable(self, capsys):
-    """The full instructions render (functions + OS) for human review."""
+  def test_code_content_text_is_printable(self, capsys):
+    """The full description renders (functions + OS) for human review."""
 
     def search(query: str) -> str:
       """Searches for the query."""
@@ -286,7 +298,7 @@ class TestMontyCodeExecutor:
         os_description="Env vars are readable via `os.getenv('NAME')`.",
     )
 
-    instructions = executor.code_instructions()
+    instructions = executor.code_content().parts[0].text
     print(instructions)
 
     captured = capsys.readouterr()
