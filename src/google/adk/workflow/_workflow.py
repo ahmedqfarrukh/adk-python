@@ -30,13 +30,13 @@ from typing import TYPE_CHECKING
 
 from pydantic import Field
 
+from ..events._branch_path import _BranchPath
 from ._base_node import BaseNode
 from ._base_node import START
 from ._dynamic_node_scheduler import DynamicNodeScheduler
 from ._dynamic_node_scheduler import DynamicNodeState
 from ._graph import EdgeItem
 from ._graph import Graph
-from ._node_runner import NodeRunner
 from ._node_state import NodeState
 from ._node_status import NodeStatus
 from ._trigger import Trigger
@@ -58,15 +58,8 @@ def get_common_branch_prefix(branches: list[str]) -> str:
   """Find the common prefix of dot-separated branch strings."""
   if not branches:
     return ''
-  split_branches = [b.split('.') if b else [] for b in branches]
-
-  common = []
-  for segments in zip(*split_branches):
-    if len(set(segments)) == 1:
-      common.append(segments[0])
-    else:
-      break
-  return '.'.join(common)
+  paths = [_BranchPath.from_string(b) for b in branches]
+  return str(_BranchPath.common_prefix(paths))
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +535,7 @@ class Workflow(BaseNode):
       node_name: str,
       trigger: Trigger,
   ) -> None:
-    """Create NodeRunner and start asyncio task for a node."""
+    """Start asyncio task for scheduling and executing a node."""
 
     assert self.graph is not None
 
@@ -608,22 +601,24 @@ class Workflow(BaseNode):
           key
       ].isolation_scope
 
-    runner = NodeRunner(
-        node=node,
-        parent_ctx=ctx,
-        run_id=run_id,
-        use_as_output=is_terminal,
-        use_sub_branch=trigger.use_sub_branch,
-        override_branch=trigger.branch,
-        override_isolation_scope=self._compute_isolation_scope_for_node(
-            node, trigger, ctx, run_id
-        ),
-    )
     resume_inputs = (
         dict(node_state.resume_inputs) if node_state.resume_inputs else None
     )
     loop_state.pending_tasks[node_name] = asyncio.create_task(
-        runner.run(node_input=trigger.input, resume_inputs=resume_inputs)
+        ctx._run_node_internal(
+            node,
+            node_input=trigger.input,
+            use_sub_branch=trigger.use_sub_branch,
+            override_branch=trigger.branch,
+            override_isolation_scope=self._compute_isolation_scope_for_node(
+                node, trigger, ctx, run_id
+            ),
+            return_ctx=True,
+            resume_inputs=resume_inputs,
+            run_id=run_id,
+            use_as_output=is_terminal,
+            skip_run_id_validation=True,
+        )
     )
 
   def _make_schedule_dynamic_node(
