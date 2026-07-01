@@ -15,22 +15,19 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import inspect
 import logging
 import threading
 from typing import Any
 from typing import Awaitable
 from typing import Callable
-from typing import Protocol
 
 from google.genai import types
 from pydantic import ConfigDict
 from pydantic import Field
-from pydantic import PrivateAttr
 from pydantic_monty import CollectString
+from pydantic_monty import Monty
 from pydantic_monty import MontyError
-from pydantic_monty import MontyRepl
 from pydantic_monty import MontyRuntimeError
 from pydantic_monty.os_access import OsFunction
 from typing_extensions import override
@@ -48,38 +45,23 @@ logger = logging.getLogger('google_adk.' + __name__)
 OsCallback = Callable[[OsFunction, tuple[Any, ...], dict[str, Any]], Any]
 
 
-class _ReplCacheFn(Protocol):
-  """The callable returned by `functools.lru_cache`.
-
-  Typed explicitly so call sites (and tests) can use both the call form and the
-  ``cache_info()`` / ``cache_clear()`` members without tripping the type checker
-  (a plain ``Callable`` exposes neither).
-  """
-
-  def __call__(self, execution_id: str) -> MontyRepl:
-    ...
-
-  def cache_info(self) -> Any:
-    ...
-
-  def cache_clear(self) -> None:
-    ...
-
-
-def _run_async_blocking(awaitable: Awaitable[Any]) -> Any:
-  """Runs `awaitable` to completion on a separate thread with a fresh loop.
+def _run_async_blocking(make_awaitable: Callable[[], Awaitable[Any]]) -> Any:
+  """Runs an awaitable to completion on a separate thread with a fresh loop.
 
   Used only when an external function is a coroutine function, so the
-  synchronous `execute_code` can drive Monty's async `feed_run_async`. Running
-  on a dedicated thread avoids `asyncio.run` failing when the calling thread
-  already has a running event loop (the ADK flow's loop).
+  synchronous `execute_code` can drive Monty's async `run_async`. Running on a
+  dedicated thread avoids `asyncio.run` failing when the calling thread already
+  has a running event loop (the ADK flow's loop).
 
-  `feed_run_async` returns a custom awaitable (not a native coroutine), so it is
-  wrapped in a coroutine before being handed to `asyncio.run` -- on Python 3.11
-  `asyncio.run` rejects non-coroutine awaitables outright.
+  `make_awaitable` is a thunk (not a ready awaitable) because `Monty.run_async`
+  must be *called* with a running event loop already installed; invoking it
+  inside `_drive` -- on the worker thread, under `asyncio.run` -- satisfies
+  that. Its result is then awaited; on Python 3.11 it is a non-native awaitable,
+  which `asyncio.run` only accepts because `_drive` wraps it in a coroutine.
 
   Args:
-    awaitable: The awaitable to run to completion.
+    make_awaitable: A zero-arg callable that creates the awaitable to run. It is
+      invoked on the worker thread, inside the running event loop.
 
   Returns:
     The value produced by the awaitable.
@@ -87,7 +69,7 @@ def _run_async_blocking(awaitable: Awaitable[Any]) -> Any:
   result: dict[str, Any] = {}
 
   async def _drive() -> Any:
-    return await awaitable
+    return await make_awaitable()
 
   def _runner() -> None:
     try:
@@ -217,20 +199,17 @@ class MontyCodeExecutor(BaseCodeExecutor):
   User-declared external functions and an optional OS callback are exposed to
   the executed code, mirroring Monty's own ``external_functions`` / ``os``
   parameters. These are independent of any framework tools; redirecting an
-  external function to a framework tool is left to the caller. State persists
-  across code blocks via a per-execution-id MontyRepl.
+  external function to a framework tool is left to the caller.
 
-  NOTE: A single MontyCodeExecutor instance carries one set of external
-  functions / OS callback and one REPL cache, so it must NOT be used by
-  multiple agents simultaneously -- give each agent its own instance. Sharing
-  one instance between an agent and its sub-agents is fine.
+  Each code block runs in a fresh, one-shot ``Monty`` interpreter, so there is
+  NO cross-block state: variables, imports, and definitions do not persist
+  between calls. The model must emit self-contained code in each block.
+
+  The executor holds only immutable configuration (external functions, OS
+  callback), so a single instance is safe to share across agents and turns.
   """
 
   model_config = ConfigDict(arbitrary_types_allowed=True)
-
-  stateful: bool = True
-  """Whether the code executor is stateful. Defaults to True so variables
-  persist across code blocks within a session."""
 
   external_functions: dict[str, Callable[..., Any]] = Field(
       default_factory=dict, exclude=True
@@ -242,7 +221,7 @@ class MontyCodeExecutor(BaseCodeExecutor):
   os_callback: OsCallback | None = Field(default=None, exclude=True)
   """Optional callback for Monty's ``os=`` run surface (filesystem/env/clock).
 
-  Passed straight to ``feed_run`` / ``feed_run_async``. It is invoked with
+  Passed straight to ``Monty.run`` / ``Monty.run_async``. It is invoked with
   ``(function_name, args, kwargs)`` -- e.g. ``('os.getenv', ('FOO',), {})`` --
   and must return the operation's result, or ``pydantic_monty.NOT_HANDLED`` to
   fall back to Monty's default unhandled behavior. None means no host access:
@@ -257,30 +236,6 @@ class MontyCodeExecutor(BaseCodeExecutor):
   script_name: str = 'agent.py'
   """The script name shown in Monty tracebacks."""
 
-  max_repl_sessions: int = 50
-  """Upper bound on cached REPL sessions; least-recently-used sessions are
-  evicted beyond this, bounding memory for a long-lived executor."""
-
-  _get_or_create_repl: _ReplCacheFn | None = PrivateAttr(default=None)
-
-  def model_post_init(self, _context: Any) -> None:
-    # Per-instance cache, keyed solely on execution_id (a str). Bounded by
-    # max_repl_sessions; least-recently-used sessions are evicted automatically.
-    # Wired here (not via a method decorator) so `self` never enters the cache
-    # key and the cache is GC'd with the instance.
-    self._get_or_create_repl = functools.lru_cache(
-        maxsize=self.max_repl_sessions
-    )(self._build_repl)
-
-  def _build_repl(self, execution_id: str) -> MontyRepl:
-    # `execution_id` is unused in the body -- it exists only as the cache key.
-    del execution_id
-    return MontyRepl(
-        script_name=self.script_name,
-        type_check=True,
-        type_check_stubs=self._build_type_stubs(),
-    )
-
   @override
   def execute_code(
       self,
@@ -289,33 +244,32 @@ class MontyCodeExecutor(BaseCodeExecutor):
   ) -> CodeExecutionResult:
     logger.debug('Executing code:\n```\n%s\n```', code_execution_input.code)
 
-    execution_id = code_execution_input.execution_id
-    if execution_id is None:
-      # Non-stateful: build a fresh throwaway REPL, bypassing the cache.
-      repl = self._build_repl('')
-    else:
-      # Always wired up in model_post_init; never None after construction.
-      assert self._get_or_create_repl is not None
-      repl = self._get_or_create_repl(execution_id)
-
     has_async = any(
         inspect.iscoroutinefunction(fn)
         for fn in self.external_functions.values()
     )
     collector = CollectString()
     try:
+      # One-shot interpreter per block: parsing and type checking happen at
+      # construction (raising MontyError subclasses), with no state carried
+      # over from any previous block.
+      monty = Monty(
+          code_execution_input.code,
+          script_name=self.script_name,
+          type_check=True,
+          type_check_stubs=self._build_type_stubs(),
+      )
       if has_async:
-        # feed_run_async must be awaited; bridge from this sync method on a
+        # run_async must be awaited; bridge from this sync method on a
         # dedicated worker thread (we may be inside the flow's running loop).
         #
-        # The `feed_run_async` stub types `os` as `AbstractOS`, but Monty only
-        # ever calls it as `os(function_name, args, kwargs)` -- exactly the
+        # The `run_async` stub types `os` as `AbstractOS`, but Monty only ever
+        # calls it as `os(function_name, args, kwargs)` -- exactly the
         # `os_callback` contract. A plain callable is verified to work here at
-        # runtime (the sync `feed_run` path is typed for a raw callable), so we
-        # pass it directly and silence the stub-only mismatch.
+        # runtime (the sync `Monty.run` path is typed for a raw callable), so
+        # we pass it directly and silence the stub-only mismatch.
         output = _run_async_blocking(
-            repl.feed_run_async(
-                code_execution_input.code,
+            lambda: monty.run_async(
                 external_functions=self.external_functions,
                 print_callback=collector,
                 os=self.os_callback,  # type: ignore[arg-type]
@@ -323,8 +277,7 @@ class MontyCodeExecutor(BaseCodeExecutor):
         )
       else:
         # No async functions: run directly, no event loop, no extra thread.
-        output = repl.feed_run(
-            code_execution_input.code,
+        output = monty.run(
             external_functions=self.external_functions,
             print_callback=collector,
             os=self.os_callback,

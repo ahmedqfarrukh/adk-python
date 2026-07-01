@@ -44,11 +44,11 @@ def mock_invocation_context() -> InvocationContext:
 
 class TestMontyCodeExecutor:
 
-  def test_init_is_stateful_by_default(self):
-    """A freshly created MontyCodeExecutor is stateful."""
+  def test_init_is_not_stateful(self):
+    """A MontyCodeExecutor is stateless; each block runs in a fresh Monty."""
     executor = MontyCodeExecutor()
 
-    assert executor.stateful is True
+    assert executor.stateful is False
 
   def test_execute_simple_code_returns_stdout(
       self, mock_invocation_context: InvocationContext
@@ -109,14 +109,15 @@ class TestMontyCodeExecutor:
     assert result.stdout == "fetched http://x\n"
     assert result.stderr == ""
 
-  def test_state_persists_across_calls_with_same_execution_id(
+  def test_state_does_not_persist_across_calls(
       self, mock_invocation_context: InvocationContext
   ):
-    """Variables defined in one block are visible in a later block.
+    """Variables defined in one block are NOT visible in a later block.
 
     Setup: one executor, two execute_code calls sharing execution_id "s1".
-    Act: first block defines `x`, second block reads it.
-    Assert: the second block sees the persisted value.
+    Act: first block defines `x`, second block tries to read it.
+    Assert: the second block errors -- there is no cross-block state, even with
+      a shared execution_id, because each block runs in a fresh Monty.
     """
     executor = MontyCodeExecutor()
 
@@ -129,8 +130,7 @@ class TestMontyCodeExecutor:
         CodeExecutionInput(code="print(x)", execution_id="s1"),
     )
 
-    assert result.stdout == "99\n"
-    assert result.stderr == ""
+    assert result.stderr != ""
 
   def test_runtime_error_is_surfaced_as_stderr(
       self, mock_invocation_context: InvocationContext
@@ -307,35 +307,7 @@ class TestMontyCodeExecutor:
     assert "def search(query: str) -> str:" in captured.out
     assert "os.getenv(" in captured.out
 
-  def test_evicted_session_loses_its_persisted_state(
-      self, mock_invocation_context: InvocationContext
-  ):
-    """An LRU-evicted session rebuilds a fresh REPL, forfeiting its variables.
-
-    Setup: max_repl_sessions=1, define `x` under execution_id "a".
-    Act: run a different execution_id "b" (evicting "a"), then re-read `x`
-      under "a".
-    Assert: "a"'s variable is gone, so the read errors into stderr.
-    """
-    executor = MontyCodeExecutor(max_repl_sessions=1)
-
-    executor.execute_code(
-        mock_invocation_context,
-        CodeExecutionInput(code="x = 1", execution_id="a"),
-    )
-    executor.execute_code(
-        mock_invocation_context,
-        CodeExecutionInput(code="y = 2", execution_id="b"),
-    )
-    result = executor.execute_code(
-        mock_invocation_context,
-        CodeExecutionInput(code="print(x)", execution_id="a"),
-    )
-
-    assert result.stderr != ""
-    assert executor._get_or_create_repl.cache_info().currsize == 1
-
-  def test_non_stateful_execution_uses_throwaway_repl(
+  def test_each_block_runs_in_a_fresh_interpreter(
       self, mock_invocation_context: InvocationContext
   ):
     """With no execution_id, state does not persist across calls."""
